@@ -1,3 +1,4 @@
+use crate::acl::{AclDecision, AclList, AclMode};
 use crate::config::{Config, ServerConfig, ServerServiceConfig, ServiceType, TransportType};
 use crate::config_watcher::{ConfigChange, ServerServiceChange};
 use crate::constants::{listen_backoff, UDP_BUFFER_SIZE};
@@ -92,6 +93,39 @@ pub async fn run_server(
 // See also MultiMap
 type ControlChannelMap<T> = MultiMap<ServiceDigest, Nonce, ControlChannelHandle<T>>;
 
+/// Runtime allowlist state shared by every listener.
+///
+/// Reloaded in place when the configuration changes, so tightening or relaxing
+/// a port never drops the other tunnels of the same relay, and flipping
+/// `acl_mode` applies to every port at once.
+struct ControlAcl {
+    /// `[server] allowed_client_ips`: who may open control channels.
+    client: AclList,
+    /// `[server] allowed_visitor_ips`: default for services that have no
+    /// `allowed_ips` of their own.
+    visitor_default: AclList,
+    mode: AclMode,
+}
+
+/// Applies one allowlist and logs the outcome.
+///
+/// Returns `true` when the peer may proceed. A denied peer is dropped before
+/// any protocol byte is exchanged (control connections fail before the
+/// transport handshake; visitor connections never reach the tunnel).
+fn acl_allows(list: &AclList, mode: AclMode, peer: std::net::SocketAddr, what: &str) -> bool {
+    match list.decide(mode, peer.ip()) {
+        AclDecision::Allow => true,
+        AclDecision::Deny => {
+            warn!(target: "acl", "Reject {} from {}: not in allowlist", what, peer);
+            false
+        }
+        AclDecision::ObserveDeny => {
+            info!(target: "acl", "Observe: {} from {} would be rejected (not in allowlist)", what, peer);
+            true
+        }
+    }
+}
+
 // Server holds all states of running a server
 struct Server<T: Transport> {
     // `[server]` config
@@ -103,6 +137,8 @@ struct Server<T: Transport> {
     control_channels: Arc<RwLock<ControlChannelMap<T>>>,
     // Wrapper around the transport layer
     transport: Arc<T>,
+    // Allowlist state (control port + service default); reloadable in place
+    control_acl: Arc<RwLock<ControlAcl>>,
 }
 
 // Generate a hash map of services which is indexed by ServiceDigest
@@ -123,11 +159,26 @@ impl<T: 'static + Transport> Server<T> {
         let services = Arc::new(RwLock::new(generate_service_hashmap(&config)));
         let control_channels = Arc::new(RwLock::new(ControlChannelMap::new()));
         let transport = Arc::new(T::new(&config.transport)?);
+        let control_acl = Arc::new(RwLock::new(ControlAcl {
+            client: AclList::parse(&config.allowed_client_ips),
+            visitor_default: AclList::parse(&config.allowed_visitor_ips),
+            mode: config.acl_mode,
+        }));
+        {
+            let acl = control_acl.read().await;
+            info!(
+                "Allowlists: control port {} | service ports (default) {} | mode {:?}",
+                acl.client.describe(),
+                acl.visitor_default.describe(),
+                acl.mode
+            );
+        }
         Ok(Server {
             config,
             services,
             control_channels,
             transport,
+            control_acl,
         })
     }
 
@@ -179,6 +230,15 @@ impl<T: 'static + Transport> Server<T> {
                         Ok((conn, addr)) => {
                             backoff.reset();
 
+                            // Allowlist check before the transport handshake: an
+                            // unlisted peer gets no protocol reply at all.
+                            {
+                                let acl = self.control_acl.read().await;
+                                if !acl_allows(&acl.client, acl.mode, addr, "control connection") {
+                                    continue;
+                                }
+                            }
+
                             // Do transport handshake with a timeout
                             match time::timeout(Duration::from_secs(HANDSHAKE_TIMEOUT), self.transport.handshake(conn)).await {
                                 Ok(conn) => {
@@ -187,8 +247,9 @@ impl<T: 'static + Transport> Server<T> {
                                             let services = self.services.clone();
                                             let control_channels = self.control_channels.clone();
                                             let server_config = self.config.clone();
+                                            let control_acl = self.control_acl.clone();
                                             tokio::spawn(async move {
-                                                if let Err(err) = handle_connection(conn, services, control_channels, server_config).await {
+                                                if let Err(err) = handle_connection(conn, services, control_channels, server_config, control_acl).await {
                                                     error!("{:#}", err);
                                                 }
                                             }.instrument(info_span!("connection", %addr)));
@@ -224,6 +285,18 @@ impl<T: 'static + Transport> Server<T> {
 
     async fn handle_hot_reload(&mut self, e: ConfigChange) {
         match e {
+            ConfigChange::ServerAclChange(change) => {
+                let mut acl = self.control_acl.write().await;
+                acl.client = AclList::parse(&change.allowed_client_ips);
+                acl.visitor_default = AclList::parse(&change.allowed_visitor_ips);
+                acl.mode = change.acl_mode;
+                info!(
+                    "Allowlists reloaded: control port {} | service ports (default) {} | mode {:?}",
+                    acl.client.describe(),
+                    acl.visitor_default.describe(),
+                    acl.mode
+                );
+            }
             ConfigChange::ServerChange(server_change) => match server_change {
                 ServerServiceChange::Add(cfg) => {
                     let hash = protocol::digest(cfg.name.as_bytes());
@@ -252,6 +325,7 @@ async fn handle_connection<T: 'static + Transport>(
     services: Arc<RwLock<HashMap<ServiceDigest, ServerServiceConfig>>>,
     control_channels: Arc<RwLock<ControlChannelMap<T>>>,
     server_config: Arc<ServerConfig>,
+    control_acl: Arc<RwLock<ControlAcl>>,
 ) -> Result<()> {
     // Read hello
     let hello = read_hello(&mut conn).await?;
@@ -263,6 +337,7 @@ async fn handle_connection<T: 'static + Transport>(
                 control_channels,
                 service_digest,
                 server_config,
+                control_acl,
             )
             .await?;
         }
@@ -279,6 +354,7 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
     control_channels: Arc<RwLock<ControlChannelMap<T>>>,
     service_digest: ServiceDigest,
     server_config: Arc<ServerConfig>,
+    control_acl: Arc<RwLock<ControlAcl>>,
 ) -> Result<()> {
     info!("Try to handshake a control channel");
 
@@ -348,8 +424,12 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
         conn.flush().await?;
 
         info!(service = %service_config.name, "Control channel established");
-        let handle =
-            ControlChannelHandle::new(conn, service_config, server_config.heartbeat_interval);
+        let handle = ControlChannelHandle::new(
+            conn,
+            service_config,
+            server_config.heartbeat_interval,
+            control_acl,
+        );
 
         // Insert the new handle
         let _ = h.insert(service_digest, session_key, handle);
@@ -403,6 +483,7 @@ where
         conn: T::Stream,
         service: ServerServiceConfig,
         heartbeat_interval: u64,
+        control_acl: Arc<RwLock<ControlAcl>>,
     ) -> ControlChannelHandle<T> {
         // Create a shutdown channel
         let (shutdown_tx, shutdown_rx) = broadcast::channel::<bool>(1);
@@ -427,23 +508,39 @@ where
 
         let shutdown_rx_clone = shutdown_tx.subscribe();
         let bind_addr = service.bind_addr.clone();
+        // A service with its own `allowed_ips` uses them; otherwise the shared
+        // `[server] allowed_visitor_ips` default is applied at check time, so a
+        // change to the default needs no reconnect.
+        let visitor_acl: Option<AclList> = if service.allowed_ips.is_empty() {
+            None
+        } else {
+            let acl = AclList::parse(&service.allowed_ips);
+            info!("Visitor allowlist for this service: {}", acl.describe());
+            Some(acl)
+        };
         match service.service_type {
-            ServiceType::Tcp => tokio::spawn(
-                async move {
-                    if let Err(e) = run_tcp_connection_pool::<T>(
-                        bind_addr,
-                        data_ch_rx,
-                        data_ch_req_tx,
-                        shutdown_rx_clone,
-                    )
-                    .await
-                    .with_context(|| "Failed to run TCP connection pool")
-                    {
-                        error!("{:#}", e);
+            ServiceType::Tcp => {
+                let visitor_acl = visitor_acl.clone();
+                let control_acl = control_acl.clone();
+                tokio::spawn(
+                    async move {
+                        if let Err(e) = run_tcp_connection_pool::<T>(
+                            bind_addr,
+                            data_ch_rx,
+                            data_ch_req_tx,
+                            shutdown_rx_clone,
+                            visitor_acl,
+                            control_acl,
+                        )
+                        .await
+                        .with_context(|| "Failed to run TCP connection pool")
+                        {
+                            error!("{:#}", e);
+                        }
                     }
-                }
-                .instrument(Span::current()),
-            ),
+                    .instrument(Span::current()),
+                )
+            }
             ServiceType::Udp => tokio::spawn(
                 async move {
                     if let Err(e) = run_udp_connection_pool::<T>(
@@ -451,6 +548,8 @@ where
                         data_ch_rx,
                         data_ch_req_tx,
                         shutdown_rx_clone,
+                        visitor_acl,
+                        control_acl,
                     )
                     .await
                     .with_context(|| "Failed to run TCP connection pool")
@@ -548,6 +647,8 @@ fn tcp_listen_and_send(
     addr: String,
     data_ch_req_tx: mpsc::UnboundedSender<bool>,
     mut shutdown_rx: broadcast::Receiver<bool>,
+    visitor_acl: Option<AclList>,
+    control_acl: Arc<RwLock<ControlAcl>>,
 ) -> mpsc::Receiver<TcpStream> {
     let (tx, rx) = mpsc::channel(CHAN_SIZE);
 
@@ -594,6 +695,18 @@ fn tcp_listen_and_send(
                             }
                         }
                         Ok((incoming, addr)) => {
+                            // Allowlist: the service's own list wins, otherwise the
+                            // shared default is read per connection so reloads of
+                            // `[server] allowed_visitor_ips` apply immediately.
+                            {
+                                let shared = control_acl.read().await;
+                                let list =
+                                    visitor_acl.as_ref().unwrap_or(&shared.visitor_default);
+                                if !acl_allows(list, shared.mode, addr, "visitor") {
+                                    continue;
+                                }
+                            }
+
                             // For every visitor, request to create a data channel
                             if data_ch_req_tx.send(true).with_context(|| "Failed to send data chan create request").is_err() {
                                 // An error indicates the control channel is broken
@@ -628,8 +741,11 @@ async fn run_tcp_connection_pool<T: Transport>(
     mut data_ch_rx: mpsc::Receiver<T::Stream>,
     data_ch_req_tx: mpsc::UnboundedSender<bool>,
     shutdown_rx: broadcast::Receiver<bool>,
+    visitor_acl: Option<AclList>,
+    control_acl: Arc<RwLock<ControlAcl>>,
 ) -> Result<()> {
-    let mut visitor_rx = tcp_listen_and_send(bind_addr, data_ch_req_tx.clone(), shutdown_rx);
+    let mut visitor_rx =
+        tcp_listen_and_send(bind_addr, data_ch_req_tx.clone(), shutdown_rx, visitor_acl, control_acl);
     let cmd = bincode::serialize(&DataChannelCmd::StartForwardTcp).unwrap();
 
     'pool: while let Some(mut visitor) = visitor_rx.recv().await {
@@ -662,6 +778,8 @@ async fn run_udp_connection_pool<T: Transport>(
     mut data_ch_rx: mpsc::Receiver<T::Stream>,
     _data_ch_req_tx: mpsc::UnboundedSender<bool>,
     mut shutdown_rx: broadcast::Receiver<bool>,
+    visitor_acl: Option<AclList>,
+    control_acl: Arc<RwLock<ControlAcl>>,
 ) -> Result<()> {
     // TODO: Load balance
 
@@ -693,6 +811,15 @@ async fn run_udp_connection_pool<T: Transport>(
             // Forward inbound traffic to the client
             val = l.recv_from(&mut buf) => {
                 let (n, from) = val?;
+                // UDP has no connection to drop: the datagram is discarded and
+                // the socket stays open for allowed peers.
+                {
+                    let shared = control_acl.read().await;
+                    let list = visitor_acl.as_ref().unwrap_or(&shared.visitor_default);
+                    if !acl_allows(list, shared.mode, from, "datagram") {
+                        continue;
+                    }
+                }
                 UdpTraffic::write_slice(&mut conn, from, &buf[..n]).await?;
             },
 

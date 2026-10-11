@@ -145,6 +145,9 @@ local_addr = "127.0.0.1:1082"
 bind_addr = "0.0.0.0:2333" # Necessary. The address that the server listens for clients. Generally only the port needs to be change.
 default_token = "default_token_if_not_specify" # Optional
 heartbeat_interval = 30 # Optional. The interval between two application-layer heartbeat. Set to 0 to disable sending heartbeat. Default: 30 seconds
+allowed_client_ips = ["203.0.113.0/24"] # Optional. Source-IP allowlist for the control port: who may open control channels. Empty = no restriction
+allowed_visitor_ips = ["10.8.0.0/16"] # Optional. Default source-IP allowlist for every service port; a service can override it. Empty = no restriction
+acl_mode = "enforce" # Optional. "enforce" (default) drops unlisted sources, "observe" only logs them. See "Restricting source addresses"
 
 [server.transport] # Same as `[client.transport]`
 type = "tcp"
@@ -171,10 +174,33 @@ type = "tcp" # Optional. Same as the client `[client.services.X.type]
 token = "whatever" # Necessary if `server.default_token` not set
 bind_addr = "0.0.0.0:8081" # Necessary. The address of the service is exposed at. Generally only the port needs to be change.
 nodelay = true # Optional. Same as the client
+allowed_ips = ["198.51.100.7"] # Optional. Source-IP allowlist for this service port; overrides `server.allowed_visitor_ips`
 
 [server.services.service2]
 bind_addr = "0.0.0.1:8082"
 ```
+
+### Restricting source addresses (IP allowlists)
+
+Every port a server exposes can be restricted to a set of source IPs or CIDR blocks. The check runs before any protocol byte is exchanged (for control channels even before the transport handshake), so an unlisted peer gets no reply at all.
+
+```toml
+[server]
+bind_addr = "0.0.0.0:21000"
+allowed_client_ips = ["203.0.113.0/24", "198.51.100.7"] # who may open control channels
+allowed_visitor_ips = ["10.8.0.0/16"]                   # default for every service (visitor) port
+acl_mode = "enforce"                                    # or "observe"
+
+[server.services.port-20005]
+allowed_ips = ["198.51.100.7"]   # this port only; overrides `allowed_visitor_ips`
+```
+
+- Empty or missing lists keep the port fully open, so existing configurations are unaffected.
+- `[server] allowed_client_ips` applies to the control port. A service uses its own `allowed_ips`, falling back to `[server] allowed_visitor_ips`. Use `["0.0.0.0/0", "::/0"]` to keep one port open while others are restricted.
+- Entries are single IPv4/IPv6 addresses or CIDR blocks; `::ffff:a.b.c.d` is accepted as its IPv4 form. A malformed entry rejects the whole configuration at load time instead of silently weakening the allowlist.
+- `acl_mode = "observe"` logs what would have been rejected (lines starting with `Observe:`) without dropping anything. Fill in a first guess of the allowlist, run it first to collect the real source list from the log, then switch to `enforce`.
+- The control list, the default visitor list and the mode are applied in place when the configuration file changes: no restart, no dropped tunnels. A changed per-service list reconfigures just that service, and its client reconnects automatically within a second.
+- The startup banner and every reload log the effective state of each level, e.g. `Allowlists: control port 2 entries | service ports (default) open (no restriction) | mode Enforce`. Rejections are logged with the `acl` target: `Reject control connection from 1.2.3.4:5678: not in allowlist`, observers as `Observe: ... would be rejected ...`.
 
 ### Logging
 

@@ -7,6 +7,7 @@ use std::path::Path;
 use tokio::fs;
 use url::Url;
 
+use crate::acl::{self, AclMode};
 use crate::transport::{DEFAULT_KEEPALIVE_INTERVAL, DEFAULT_KEEPALIVE_SECS, DEFAULT_NODELAY};
 
 /// Application-layer heartbeat interval in secs
@@ -104,6 +105,10 @@ pub struct ServerServiceConfig {
     pub bind_addr: String,
     pub token: Option<MaskedString>,
     pub nodelay: Option<bool>,
+    /// Source-IP allowlist for this service's visitor port (single IPs or CIDR
+    /// blocks). Empty = inherit `[server] allowed_visitor_ips`.
+    #[serde(default)]
+    pub allowed_ips: Vec<String>,
 }
 
 impl ServerServiceConfig {
@@ -227,6 +232,17 @@ pub struct ServerConfig {
     pub transport: TransportConfig,
     #[serde(default = "default_heartbeat_interval")]
     pub heartbeat_interval: u64,
+    /// Source-IP allowlist for the **control port** (`bind_addr`): who may open
+    /// control channels. Single IPs or CIDR blocks; empty = no restriction.
+    #[serde(default)]
+    pub allowed_client_ips: Vec<String>,
+    /// Default source-IP allowlist for **every service (visitor) port**; a
+    /// service overrides it with its own `allowed_ips`. Empty = no restriction.
+    #[serde(default)]
+    pub allowed_visitor_ips: Vec<String>,
+    /// `enforce` (default) drops unlisted sources; `observe` only logs them.
+    #[serde(default)]
+    pub acl_mode: AclMode,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
@@ -256,9 +272,18 @@ impl Config {
     }
 
     fn validate_server_config(server: &mut ServerConfig) -> Result<()> {
+        // Allowlists are validated up front so a typo rejects the whole config
+        // instead of silently disabling (or over-blocking) a port later.
+        acl::validate_entries(&server.allowed_client_ips)
+            .with_context(|| "Invalid `[server] allowed_client_ips`")?;
+        acl::validate_entries(&server.allowed_visitor_ips)
+            .with_context(|| "Invalid `[server] allowed_visitor_ips`")?;
+
         // Validate services
         for (name, s) in &mut server.services {
             s.name = name.clone();
+            acl::validate_entries(&s.allowed_ips)
+                .with_context(|| format!("Invalid `allowed_ips` of service `{}`", name))?;
             if s.token.is_none() {
                 s.token = server.default_token.clone();
                 if s.token.is_none() {

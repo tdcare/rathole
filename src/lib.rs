@@ -1,3 +1,4 @@
+mod acl;
 mod cli;
 mod config;
 mod config_watcher;

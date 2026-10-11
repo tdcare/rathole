@@ -1,4 +1,5 @@
 use crate::{
+    acl::AclMode,
     config::{ClientConfig, ClientServiceConfig, ServerConfig, ServerServiceConfig},
     Config,
 };
@@ -19,6 +20,16 @@ pub enum ConfigChange {
     General(Box<Config>), // Trigger a full restart
     ServerChange(ServerServiceChange),
     ClientChange(ClientServiceChange),
+    /// Allowlists changed: applied to the running instance in place.
+    ServerAclChange(ServerAclChange),
+}
+
+/// New allowlist state for a running server, applied without a restart.
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub struct ServerAclChange {
+    pub allowed_client_ips: Vec<String>,
+    pub allowed_visitor_ips: Vec<String>,
+    pub acl_mode: AclMode,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -39,22 +50,26 @@ trait InstanceConfig: Clone {
     fn service_delete_change(s: String) -> ConfigChange;
     fn service_add_change(cfg: Self::ServiceConfig) -> ConfigChange;
     fn get_services(&self) -> &HashMap<String, Self::ServiceConfig>;
+    /// Settings that can be applied to a running instance without a restart.
+    fn soft_change(&self, _new: &Self) -> Option<ConfigChange> {
+        None
+    }
 }
 
 impl InstanceConfig for ServerConfig {
     type ServiceConfig = ServerServiceConfig;
     fn equal_without_service(&self, rhs: &Self) -> bool {
-        let left = ServerConfig {
+        // Allowlists are compared separately (see `soft_change`) so that
+        // tightening or relaxing them never restarts the instance.
+        let scrub = |c: &ServerConfig| ServerConfig {
             services: Default::default(),
-            ..self.clone()
+            allowed_client_ips: Default::default(),
+            allowed_visitor_ips: Default::default(),
+            acl_mode: Default::default(),
+            ..c.clone()
         };
 
-        let right = ServerConfig {
-            services: Default::default(),
-            ..rhs.clone()
-        };
-
-        left == right
+        scrub(self) == scrub(rhs)
     }
     fn service_delete_change(s: String) -> ConfigChange {
         ConfigChange::ServerChange(ServerServiceChange::Delete(s))
@@ -64,6 +79,20 @@ impl InstanceConfig for ServerConfig {
     }
     fn get_services(&self) -> &HashMap<String, Self::ServiceConfig> {
         &self.services
+    }
+    fn soft_change(&self, new: &Self) -> Option<ConfigChange> {
+        if self.allowed_client_ips != new.allowed_client_ips
+            || self.allowed_visitor_ips != new.allowed_visitor_ips
+            || self.acl_mode != new.acl_mode
+        {
+            Some(ConfigChange::ServerAclChange(ServerAclChange {
+                allowed_client_ips: new.allowed_client_ips.clone(),
+                allowed_visitor_ips: new.allowed_visitor_ips.clone(),
+                acl_mode: new.acl_mode,
+            }))
+        } else {
+            None
+        }
     }
 }
 
@@ -244,6 +273,9 @@ fn calculate_instance_config_events<T: InstanceConfig>(
         return None;
     }
 
+    // In-place changes (allowlists) come first, then service add/delete.
+    let mut ret: Vec<ConfigChange> = old.soft_change(new).into_iter().collect();
+
     let old = old.get_services();
     let new = new.get_services();
 
@@ -257,7 +289,8 @@ fn calculate_instance_config_events<T: InstanceConfig>(
         .filter(|(name, c)| old.get(*name) != Some(*c))
         .map(|(_, c)| T::service_add_change(c.clone()));
 
-    Some(deletions.chain(addition).collect())
+    ret.extend(deletions.chain(addition));
+    Some(ret)
 }
 
 #[cfg(test)]
@@ -358,6 +391,45 @@ mod test {
                     }),
                 },
             },
+            Test {
+                // Allowlist-only change: applied in place, no restart.
+                old: Config {
+                    server: Some(ServerConfig {
+                        bind_addr: String::from("127.0.0.1:2333"),
+                        ..Default::default()
+                    }),
+                    client: None,
+                },
+                new: Config {
+                    server: Some(ServerConfig {
+                        bind_addr: String::from("127.0.0.1:2333"),
+                        allowed_client_ips: vec![String::from("10.0.0.0/8")],
+                        allowed_visitor_ips: vec![String::from("192.168.1.0/24")],
+                        ..Default::default()
+                    }),
+                    client: None,
+                },
+            },
+            Test {
+                // Changing one port's allowlist only reconfigures that service.
+                old: Config {
+                    server: Some(ServerConfig {
+                        services: collection!(String::from("p20005") => ServerServiceConfig::with_name("p20005")),
+                        ..Default::default()
+                    }),
+                    client: None,
+                },
+                new: Config {
+                    server: Some(ServerConfig {
+                        services: collection!(String::from("p20005") => ServerServiceConfig {
+                            allowed_ips: vec![String::from("198.51.100.7")],
+                            ..ServerServiceConfig::with_name("p20005")
+                        }),
+                        ..Default::default()
+                    }),
+                    client: None,
+                },
+            },
         ];
 
         let mut expected = [
@@ -383,6 +455,14 @@ mod test {
                     tests[4].new.client.as_ref().unwrap().services["bar2"].clone(),
                 )),
             ],
+            vec![ConfigChange::ServerAclChange(ServerAclChange {
+                allowed_client_ips: vec![String::from("10.0.0.0/8")],
+                allowed_visitor_ips: vec![String::from("192.168.1.0/24")],
+                acl_mode: crate::acl::AclMode::Enforce,
+            })],
+            vec![ConfigChange::ServerChange(ServerServiceChange::Add(
+                tests[6].new.server.as_ref().unwrap().services["p20005"].clone(),
+            ))],
         ];
 
         assert_eq!(tests.len(), expected.len());
@@ -397,6 +477,7 @@ mod test {
                         ServerServiceChange::Add(c) => "s_add_".to_owned() + &c.name,
                         ServerServiceChange::Delete(s) => "s_del_".to_owned() + s,
                     },
+                    ConfigChange::ServerAclChange(_) => String::from("s_acl"),
                     ConfigChange::ClientChange(sc) => match sc {
                         ClientServiceChange::Add(c) => "c_add_".to_owned() + &c.name,
                         ClientServiceChange::Delete(s) => "c_del_".to_owned() + s,
