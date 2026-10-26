@@ -216,6 +216,13 @@ pub struct ClientConfig {
     pub heartbeat_timeout: u64,
     #[serde(default = "default_client_retry_interval")]
     pub retry_interval: u64,
+    /// Multiplex all data channels of every service over a single persistent
+    /// connection instead of opening one TCP connection per visitor.
+    /// Off by default; when on, the client first tries a `MuxChannelHello`
+    /// carrier and auto-falls back to the legacy per-connection mode if the
+    /// server doesn't understand it.
+    #[serde(default)]
+    pub mux: bool,
 }
 
 fn default_heartbeat_interval() -> u64 {
@@ -243,6 +250,11 @@ pub struct ServerConfig {
     /// `enforce` (default) drops unlisted sources; `observe` only logs them.
     #[serde(default)]
     pub acl_mode: AclMode,
+    /// Accept data channels multiplexed over a single persistent connection
+    /// (see `[client] mux`). Backward compatible: legacy per-connection data
+    /// channels keep working regardless of this flag.
+    #[serde(default)]
+    pub mux: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]

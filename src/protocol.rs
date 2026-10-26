@@ -20,6 +20,12 @@ pub type Digest = [u8; HASH_WIDTH_IN_BYTES];
 pub enum Hello {
     ControlChannelHello(ProtocolVersion, Digest), // sha256sum(service name) or a nonce
     DataChannelHello(ProtocolVersion, Digest),    // token provided by CreateDataChannel
+    // New (mux feature): this connection is a multiplexed carrier for data
+    // channels. Added as a third variant so the wire format of the existing
+    // two is unchanged (bincode enum discriminants 0/1 stay the same); old
+    // clients never emit it and old servers simply never see it. NOT bumping
+    // PROTO_VERSION keeps backward compatibility.
+    MuxChannelHello(ProtocolVersion, Digest), // sha256sum(service name)
 }
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -193,6 +199,15 @@ pub async fn read_hello<T: AsyncRead + AsyncWrite + Unpin>(conn: &mut T) -> Resu
             }
         }
         Hello::DataChannelHello(v, _) => {
+            if v != CURRENT_PROTO_VERSION {
+                bail!(
+                    "Protocol version mismatched. Expected {}, got {}. Please update `rathole`.",
+                    CURRENT_PROTO_VERSION,
+                    v
+                );
+            }
+        }
+        Hello::MuxChannelHello(v, _) => {
             if v != CURRENT_PROTO_VERSION {
                 bail!(
                     "Protocol version mismatched. Expected {}, got {}. Please update `rathole`.",

@@ -5,6 +5,7 @@ mod config_watcher;
 mod constants;
 mod helper;
 mod multi_map;
+mod mux;
 mod protocol;
 mod transport;
 

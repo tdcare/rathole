@@ -9,6 +9,7 @@ use crate::protocol::{
     self, read_auth, read_hello, Ack, ControlChannelCmd, DataChannelCmd, Hello, UdpTraffic,
     HASH_WIDTH_IN_BYTES,
 };
+use crate::mux::BoxedStream;
 use crate::transport::{SocketOpts, TcpTransport, Transport};
 use anyhow::{anyhow, bail, Context, Result};
 use backoff::backoff::Backoff;
@@ -344,6 +345,13 @@ async fn handle_connection<T: 'static + Transport>(
         DataChannelHello(_, nonce) => {
             do_data_channel_handshake(conn, control_channels, nonce).await?;
         }
+        Hello::MuxChannelHello(_, service_digest) => {
+            if server_config.mux {
+                do_mux_handshake(conn, control_channels, service_digest).await?;
+            } else {
+                warn!("Received MuxChannelHello but `[server] mux` is disabled; dropping carrier");
+            }
+        }
     }
     Ok(())
 }
@@ -451,12 +459,14 @@ async fn do_data_channel_handshake<T: 'static + Transport>(
         Some(handle) => {
             T::hint(&conn, SocketOpts::from_server_cfg(&handle.service));
 
-            // Send the data channel to the corresponding control channel
+            // Send the data channel to the corresponding control channel.
+            // Erase the concrete stream type so the pool can also hold yamux
+            // streams coming from a multiplexed carrier (see `serve_mux`).
             handle
                 .data_ch_tx
-                .send(conn)
+                .send(Box::new(conn) as BoxedStream)
                 .await
-                .with_context(|| "Data channel for a stale control channel")?;
+                .map_err(|_| anyhow!("Data channel for a stale control channel"))?;
         }
         None => {
             warn!("Data channel has incorrect nonce");
@@ -465,11 +475,54 @@ async fn do_data_channel_handshake<T: 'static + Transport>(
     Ok(())
 }
 
+/// Handle a mux carrier connection: ack it, run a yamux server session, and
+/// route each accepted logical stream into the owning control channel's data
+/// channel pool. Routing uses the per-stream `DataChannelHello(nonce)`, exactly
+/// like a legacy per-connection data channel, so the pool logic is unchanged.
+async fn do_mux_handshake<T: 'static + Transport>(
+    mut conn: T::Stream,
+    control_channels: Arc<RwLock<ControlChannelMap<T>>>,
+    _service_digest: ServiceDigest,
+) -> Result<()> {
+    // Ack the carrier so the client proceeds to open yamux streams on it.
+    conn.write_all(&bincode::serialize(&Ack::Ok).unwrap()).await?;
+    conn.flush().await?;
+
+    let (accept_tx, mut accept_rx) = mpsc::channel::<BoxedStream>(TCP_POOL_SIZE);
+    tokio::spawn(crate::mux::serve_mux(conn, accept_tx));
+
+    while let Some(mut stream) = accept_rx.recv().await {
+        let control_channels = control_channels.clone();
+        tokio::spawn(async move {
+            match read_hello(&mut stream).await {
+                Ok(DataChannelHello(_, nonce)) => {
+                    let ch = control_channels.read().await;
+                    match ch.get2(&nonce) {
+                        Some(handle) => {
+                            if let Err(e) = handle.data_ch_tx.send(stream).await {
+                                debug!("Dropped a mux stream: {:?}", e);
+                            }
+                        }
+                        None => warn!("Mux stream with unknown session nonce"),
+                    }
+                }
+                Ok(_) => warn!("Mux stream sent a non-data hello"),
+                Err(e) => debug!("Failed to read mux stream hello: {:#}", e),
+            }
+        });
+    }
+    Ok(())
+}
+
 pub struct ControlChannelHandle<T: Transport> {
     // Shutdown the control channel by dropping it
     _shutdown_tx: broadcast::Sender<bool>,
-    data_ch_tx: mpsc::Sender<T::Stream>,
+    data_ch_tx: mpsc::Sender<BoxedStream>,
     service: ServerServiceConfig,
+    // `data_ch_tx` no longer mentions `T` (streams are type-erased into
+    // `BoxedStream`), but the surrounding map and task signatures are still
+    // generic over the transport, so keep the parameter tied with a PhantomData.
+    _phantom: std::marker::PhantomData<T>,
 }
 
 impl<T> ControlChannelHandle<T>
@@ -583,6 +636,7 @@ where
             _shutdown_tx: shutdown_tx,
             data_ch_tx,
             service,
+            _phantom: std::marker::PhantomData,
         }
     }
 }
@@ -738,7 +792,7 @@ fn tcp_listen_and_send(
 #[instrument(skip_all)]
 async fn run_tcp_connection_pool<T: Transport>(
     bind_addr: String,
-    mut data_ch_rx: mpsc::Receiver<T::Stream>,
+    mut data_ch_rx: mpsc::Receiver<BoxedStream>,
     data_ch_req_tx: mpsc::UnboundedSender<bool>,
     shutdown_rx: broadcast::Receiver<bool>,
     visitor_acl: Option<AclList>,
@@ -775,7 +829,7 @@ async fn run_tcp_connection_pool<T: Transport>(
 #[instrument(skip_all)]
 async fn run_udp_connection_pool<T: Transport>(
     bind_addr: String,
-    mut data_ch_rx: mpsc::Receiver<T::Stream>,
+    mut data_ch_rx: mpsc::Receiver<BoxedStream>,
     _data_ch_req_tx: mpsc::UnboundedSender<bool>,
     mut shutdown_rx: broadcast::Receiver<bool>,
     visitor_acl: Option<AclList>,

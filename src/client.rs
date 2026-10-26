@@ -6,6 +6,7 @@ use crate::protocol::{
     self, read_ack, read_control_cmd, read_data_cmd, read_hello, Ack, Auth, ControlChannelCmd,
     DataChannelCmd, UdpTraffic, CURRENT_PROTO_VERSION, HASH_WIDTH_IN_BYTES,
 };
+use crate::mux::{BoxedStream, MuxClientHandle};
 use crate::transport::{AddrMaybeCached, SocketOpts, TcpTransport, Transport};
 use anyhow::{anyhow, bail, Context, Result};
 use backoff::backoff::Backoff;
@@ -112,6 +113,7 @@ impl<T: 'static + Transport> Client<T> {
                 self.config.remote_addr.clone(),
                 self.transport.clone(),
                 self.config.heartbeat_timeout,
+                self.config.mux,
             );
             self.service_handles.insert(name.clone(), handle);
         }
@@ -154,6 +156,7 @@ impl<T: 'static + Transport> Client<T> {
                         self.config.remote_addr.clone(),
                         self.transport.clone(),
                         self.config.heartbeat_timeout,
+                        self.config.mux,
                     );
                     let _ = self.service_handles.insert(name, handle);
                 }
@@ -172,37 +175,50 @@ struct RunDataChannelArgs<T: Transport> {
     connector: Arc<T>,
     socket_opts: SocketOpts,
     service: ClientServiceConfig,
+    // When Some, data channels ride over this shared mux carrier instead of
+    // dialing a fresh connection each time. None = legacy per-connection mode.
+    mux: Option<Arc<MuxClientHandle>>,
 }
 
 async fn do_data_channel_handshake<T: Transport>(
     args: Arc<RunDataChannelArgs<T>>,
-) -> Result<T::Stream> {
-    // Retry at least every 100ms, at most for 10 seconds
-    let backoff = ExponentialBackoff {
-        max_interval: Duration::from_millis(100),
-        max_elapsed_time: Some(Duration::from_secs(10)),
-        ..Default::default()
+) -> Result<BoxedStream> {
+    // Obtain the stream: either a yamux logical stream over the shared carrier,
+    // or (legacy) a brand-new connection dialed per data channel.
+    let mut conn: BoxedStream = match args.mux.clone() {
+        Some(mux) => mux
+            .open_stream()
+            .await
+            .with_context(|| "Failed to open a mux stream")?,
+        None => {
+            // Retry at least every 100ms, at most for 10 seconds
+            let backoff = ExponentialBackoff {
+                max_interval: Duration::from_millis(100),
+                max_elapsed_time: Some(Duration::from_secs(10)),
+                ..Default::default()
+            };
+
+            let raw: T::Stream = retry_notify(
+                backoff,
+                || async {
+                    args.connector
+                        .connect(&args.remote_addr)
+                        .await
+                        .with_context(|| format!("Failed to connect to {}", &args.remote_addr))
+                        .map_err(backoff::Error::transient)
+                },
+                |e, duration| {
+                    warn!("{:#}. Retry in {:?}", e, duration);
+                },
+            )
+            .await?;
+
+            T::hint(&raw, args.socket_opts);
+            Box::new(raw) as BoxedStream
+        }
     };
 
-    // Connect to remote_addr
-    let mut conn: T::Stream = retry_notify(
-        backoff,
-        || async {
-            args.connector
-                .connect(&args.remote_addr)
-                .await
-                .with_context(|| format!("Failed to connect to {}", &args.remote_addr))
-                .map_err(backoff::Error::transient)
-        },
-        |e, duration| {
-            warn!("{:#}. Retry in {:?}", e, duration);
-        },
-    )
-    .await?;
-
-    T::hint(&conn, args.socket_opts);
-
-    // Send nonce
+    // Send nonce (same on both paths; the server routes the stream by it)
     let v: &[u8; HASH_WIDTH_IN_BYTES] = args.session_key[..].try_into().unwrap();
     let hello = Hello::DataChannelHello(CURRENT_PROTO_VERSION, v.to_owned());
     conn.write_all(&bincode::serialize(&hello).unwrap()).await?;
@@ -221,13 +237,13 @@ async fn run_data_channel<T: Transport>(args: Arc<RunDataChannelArgs<T>>) -> Res
             if args.service.service_type != ServiceType::Tcp {
                 bail!("Expect TCP traffic. Please check the configuration.")
             }
-            run_data_channel_for_tcp::<T>(conn, &args.service.local_addr).await?;
+            run_data_channel_for_tcp(conn, &args.service.local_addr).await?;
         }
         DataChannelCmd::StartForwardUdp => {
             if args.service.service_type != ServiceType::Udp {
                 bail!("Expect UDP traffic. Please check the configuration.")
             }
-            run_data_channel_for_udp::<T>(conn, &args.service.local_addr, args.service.prefer_ipv6).await?;
+            run_data_channel_for_udp(conn, &args.service.local_addr, args.service.prefer_ipv6).await?;
         }
     }
     Ok(())
@@ -235,8 +251,8 @@ async fn run_data_channel<T: Transport>(args: Arc<RunDataChannelArgs<T>>) -> Res
 
 // Simply copying back and forth for TCP
 #[instrument(skip(conn))]
-async fn run_data_channel_for_tcp<T: Transport>(
-    mut conn: T::Stream,
+async fn run_data_channel_for_tcp(
+    mut conn: BoxedStream,
     local_addr: &str,
 ) -> Result<()> {
     debug!("New data channel starts forwarding");
@@ -255,7 +271,7 @@ async fn run_data_channel_for_tcp<T: Transport>(
 type UdpPortMap = Arc<RwLock<HashMap<SocketAddr, mpsc::Sender<Bytes>>>>;
 
 #[instrument(skip(conn))]
-async fn run_data_channel_for_udp<T: Transport>(conn: T::Stream, local_addr: &str, prefer_ipv6: bool) -> Result<()> {
+async fn run_data_channel_for_udp(conn: BoxedStream, local_addr: &str, prefer_ipv6: bool) -> Result<()> {
     debug!("New data channel starts forwarding");
 
     let port_map: UdpPortMap = Arc::new(RwLock::new(HashMap::new()));
@@ -384,6 +400,34 @@ async fn run_udp_forwarder(
     Ok(())
 }
 
+// Establish a persistent mux carrier connection for a service's data channels.
+// Sends `MuxChannelHello` and waits for `Ack::Ok`. A legacy server cannot parse
+// the new hello variant and drops the connection, which surfaces here as an
+// error so the caller can fall back to the per-connection mode.
+async fn establish_mux_carrier<T: Transport>(
+    transport: Arc<T>,
+    remote_addr: &AddrMaybeCached,
+    digest: &ServiceDigest,
+) -> Result<Arc<MuxClientHandle>> {
+    let mut conn = transport
+        .connect(remote_addr)
+        .await
+        .with_context(|| format!("Failed to connect mux carrier to {}", remote_addr))?;
+    T::hint(&conn, SocketOpts::for_control_channel());
+
+    let hello = Hello::MuxChannelHello(CURRENT_PROTO_VERSION, digest[..].try_into().unwrap());
+    conn.write_all(&bincode::serialize(&hello).unwrap()).await?;
+    conn.flush().await?;
+
+    match read_ack(&mut conn).await? {
+        Ack::Ok => {}
+        v => bail!("server rejected the mux carrier: {}", v),
+    }
+
+    info!("Mux carrier established");
+    Ok(MuxClientHandle::start(conn))
+}
+
 // Control channel, using T as the transport layer
 struct ControlChannel<T: Transport> {
     digest: ServiceDigest,              // SHA256 of the service name
@@ -392,6 +436,7 @@ struct ControlChannel<T: Transport> {
     remote_addr: String,                // `client.remote_addr`
     transport: Arc<T>,                  // Wrapper around the transport layer
     heartbeat_timeout: u64,             // Application layer heartbeat timeout in secs
+    mux: bool,                          // Whether to multiplex data channels over a carrier
 }
 
 // Handle of a control channel
@@ -453,6 +498,22 @@ impl<T: 'static + Transport> ControlChannel<T> {
         // Channel ready
         info!("Control channel established");
 
+        // Optionally establish a persistent mux carrier for this service's data
+        // channels. On any failure (e.g. a legacy server that can't parse the
+        // mux hello) fall back to per-connection mode so behavior is never
+        // worse than not enabling mux at all.
+        let mux_handle = if self.mux {
+            match establish_mux_carrier(self.transport.clone(), &remote_addr, &self.digest).await {
+                Ok(h) => Some(h),
+                Err(e) => {
+                    warn!("{:#}. Falling back to legacy per-connection mode", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         // Socket options for the data channel
         let socket_opts = SocketOpts::from_client_cfg(&self.service);
         let data_ch_args = Arc::new(RunDataChannelArgs {
@@ -461,6 +522,7 @@ impl<T: 'static + Transport> ControlChannel<T> {
             connector: self.transport.clone(),
             socket_opts,
             service: self.service.clone(),
+            mux: mux_handle,
         });
 
         loop {
@@ -501,6 +563,7 @@ impl ControlChannelHandle {
         remote_addr: String,
         transport: Arc<T>,
         heartbeat_timeout: u64,
+        mux: bool,
     ) -> ControlChannelHandle {
         let digest = protocol::digest(service.name.as_bytes());
 
@@ -516,6 +579,7 @@ impl ControlChannelHandle {
             remote_addr,
             transport,
             heartbeat_timeout,
+            mux,
         };
 
         tokio::spawn(

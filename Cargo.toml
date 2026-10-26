@@ -120,6 +120,8 @@ tokio-tungstenite = { version = "0.20.1", optional = true }
 tokio-util = { version = "0.7.9", optional = true, features = ["io"] }
 futures-core = { version = "0.3.28", optional = true }
 futures-sink = { version = "0.3.28", optional = true }
+futures = "0.3"
+tokio-yamux = "=0.3.13"
 tokio-native-tls = { version = "0.3", optional = true }
 tokio-rustls = { version = "0.25", optional = true }
 rustls-native-certs = { version = "0.7", optional = true }
